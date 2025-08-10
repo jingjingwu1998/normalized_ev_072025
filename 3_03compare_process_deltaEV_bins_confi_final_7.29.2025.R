@@ -129,3 +129,77 @@ save(
 write.csv(as.data.frame(result_rbl_gcbc_vs_nbc_gcbc$diff), "diff_rbl_gcbc_vs_nbc_gcbc.csv")
 write.csv(as.data.frame(result_rbl_lcl_vs_nbc_lcl$diff), "diff_rbl_lcl_vs_nbc_lcl.csv")
 write.csv(as.data.frame(result_rbl_lcl_vs_rbl_nbc$diff), "diff_rbl_lcl_vs_rbl_nbc.csv")
+
+
+# Step 7: Save a GRanges object directly to disk as .rds.
+# .rds preserves all the genomic ranges info, metadata columns (like sign and deltaEV), and can be loaded back exactly as it was
+# This is the best format for TxDb analysis because you can use it directly with findOverlaps() without any conversion.export_gr_rds <- function(gr, path_rds) {
+  saveRDS(gr, file = path_rds)
+}
+
+#Starts a BED export function.
+
+export_gr_bed <- function(gr, path_bed, name_prefix = "feat") {
+  if (length(gr) == 0L) {
+    write.table(data.frame(), file = path_bed, sep = "\t", quote = FALSE,
+                row.names = FALSE, col.names = FALSE)
+    return(invisible(NULL))
+  }
+  # Converts GRanges to a BED-compatible table:
+  df <- data.frame(
+    seqnames = as.character(GenomicRanges::seqnames(gr)),
+    start    = GenomicRanges::start(gr) - 1L,          # BED is 0-based, half-open
+    end      = GenomicRanges::end(gr),                 # end is 1-based in GRanges; OK for BED
+    name     = paste0(name_prefix, "_", seq_along(gr)),
+    score    = ".",
+    strand   = ifelse(is.na(as.character(GenomicRanges::strand(gr))),
+                      ".", as.character(GenomicRanges::strand(gr)))
+  )
+  # Optional: carry sign/deltaEV into the "name" column for quick glance
+  # Enhancement: If your GRanges has a sign or deltaEV column, append those values to the name field in the BED.
+  # This makes it easier to see direction (sign) and magnitude (deltaEV) in genome browsers.
+  if ("sign" %in% names(mcols(gr))) {
+    s <- as.integer(mcols(gr)$sign)
+    df$name <- paste0(df$name, "_sign", s)
+  }
+  if ("deltaEV" %in% names(mcols(gr))) {
+    # Round for compactness
+    d <- round(as.numeric(mcols(gr)$deltaEV), 4)
+    df$name <- paste0(df$name, "_dEV", d)
+  }
+  # Writes the BED file without headers (standard for BED format).
+  write.table(df, file = path_bed, sep = "\t", quote = FALSE,
+              row.names = FALSE, col.names = FALSE)
+}
+
+# Convenience: export both formats with a base name
+# Export both formats at once
+export_gr_both <- function(gr, base) {
+  export_gr_rds(gr, paste0(base, ".rds"))
+  export_gr_bed(gr, paste0(base, ".bed"), name_prefix = basename(base))
+}
+
+# =========================
+# Export SAME/DIFF bins + merged regions for each comparison
+# =========================
+# result_* objects exist from your compare_transitions() calls:
+# - result_rbl_gcbc_vs_nbc_gcbc
+# - result_rbl_lcl_vs_nbc_lcl
+# - result_rbl_lcl_vs_rbl_nbc
+
+# A little helper to export all pieces for a comparison result
+# Export SAME/DIFF bins for each comparison
+export_all_for_result <- function(res, tag) {
+  # per-bin
+  export_gr_both(res$same,        paste0("same_bins_",   tag))
+  export_gr_both(res$diff,        paste0("diff_bins_",   tag))
+  # merged regions
+  export_gr_both(res$merged_same, paste0("regions_same_", tag))
+  export_gr_both(res$merged_diff, paste0("regions_diff_", tag))
+}
+
+export_all_for_result(result_rbl_gcbc_vs_nbc_gcbc, "rbl_gcbc_vs_nbc_gcbc")
+export_all_for_result(result_rbl_lcl_vs_nbc_lcl,   "rbl_lcl_vs_nbc_lcl")
+export_all_for_result(result_rbl_lcl_vs_rbl_nbc,   "rbl_lcl_vs_rbl_nbc")
+
+cat("✅ Exported SAME/DIFF bins and merged regions as both .rds (GRanges) and .bed (0-based).\n")
