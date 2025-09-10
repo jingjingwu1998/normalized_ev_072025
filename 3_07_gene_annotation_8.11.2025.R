@@ -1,170 +1,143 @@
-#!/usr/bin/env Rscript
-## Overlay merged SAME/DIFF regions with genes from TxDb (NO GTF)
-## Outputs: overlay_results/genes_{TAG}_{same|diff}.csv
 
-suppressPackageStartupMessages({
-  library(GenomicFeatures)              # genes()
-  library(TxDb.Hsapiens.UCSC.hg19.knownGene)
-  library(org.Hs.eg.db)                 # Entrez -> Symbol
-  library(GenomicRanges)
-  library(IRanges)
-  library(S4Vectors)
-  library(AnnotationDbi)
-  library(GenomeInfoDb)                 # seqlevelsStyle
-  if (requireNamespace("rtracklayer", quietly = TRUE)) library(rtracklayer)
-})
+## ====== Libraries ======
+library(GenomicRanges)
+library(GenomeInfoDb)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(org.Hs.eg.db)
 
-## ---------------------------
-## USER SETTINGS
-## ---------------------------
-input_dir   <- "/Users/80030577/Desktop/HiC_analysis/EV_normalization/gene_annotation_ready_to_run_8.11.2025"
-overlay_dir <- file.path(input_dir, "overlay_results")
-dir.create(overlay_dir, showWarnings = FALSE, recursive = TRUE)
-
-tags <- c("rbl_gcbc_vs_nbc_gcbc", "rbl_lcl_vs_nbc_lcl", "rbl_lcl_vs_rbl_nbc")
-
-pad_kb        <- 10
-upstream_kb   <- NULL
-downstream_kb <- NULL
-strand_aware  <- FALSE
-
-## ---------------------------
-## Helpers
-## ---------------------------
-coerce_to_gr <- function(x) {
-  if (inherits(x, "GRanges"))     return(x)
-  if (inherits(x, "GRangesList")) return(unlist(x, use.names = FALSE))
-  if (is.list(x)) {
-    parts <- lapply(x, coerce_to_gr)
-    parts <- parts[vapply(parts, function(g) inherits(g, "GRanges") && length(g) > 0, logical(1))]
-    if (length(parts) == 0L) return(GenomicRanges::GRanges())
-    return(do.call(c, parts))
-  }
-  GenomicRanges::GRanges()
-}
-
-load_regions <- function(input_dir, kind = c("same","diff"), tag) {
-  kind <- match.arg(kind)
-  base <- file.path(input_dir, paste0("regions_", kind, "_", tag))
-  paths <- c(paste0(base, ".rds"), paste0(base, ".bed"), paste0(base, ".csv"))
-  exists_vec <- file.exists(paths)
-  if (!any(exists_vec)) {
-    message("[load_regions] Missing: ", base, "(.rds/.bed/.csv). Returning empty GRanges.")
-    return(GRanges())
-  }
-  if (exists_vec[1]) {
-    obj <- readRDS(paths[1]); return(coerce_to_gr(obj))
-  } else if (exists_vec[2]) {
-    if (!requireNamespace("rtracklayer", quietly = TRUE))
-      stop("Found BED but rtracklayer not installed; install it or provide .rds/.csv.")
-    return(coerce_to_gr(rtracklayer::import(paths[2], format = "BED")))
-  } else {
-    df <- read.csv(paths[3], stringsAsFactors = FALSE)
-    req <- c("seqnames","start","end")
-    if (!all(req %in% names(df))) stop("CSV missing seqnames/start/end: ", paths[3])
-    return(GRanges(seqnames=df$seqnames, ranges=IRanges(start=as.integer(df$start), end=as.integer(df$end))))
-  }
-}
-
-pad_genes <- function(genes_gr, pad_kb = 0, upstream_kb = NULL, downstream_kb = NULL, strand_aware = FALSE) {
-  genes_gr <- coerce_to_gr(genes_gr)
-  if (length(genes_gr) == 0L) return(genes_gr)
-  if (!is.null(upstream_kb) || !is.null(downstream_kb)) {
-    up <- if (is.null(upstream_kb)) 0L else as.integer(round(upstream_kb*1000))
-    dn <- if (is.null(downstream_kb)) 0L else as.integer(round(downstream_kb*1000))
-    if (strand_aware) {
-      on_plus <- as.character(strand(genes_gr)) %in% c("+","*")
-      start(genes_gr)[on_plus]  <- pmax(1L, start(genes_gr)[on_plus] - up)
-      end(genes_gr)[on_plus]    <- end(genes_gr)[on_plus] + dn
-      start(genes_gr)[!on_plus] <- pmax(1L, start(genes_gr)[!on_plus] - dn)
-      end(genes_gr)[!on_plus]   <- end(genes_gr)[!on_plus] + up
-    } else {
-      start(genes_gr) <- pmax(1L, start(genes_gr) - up)
-      end(genes_gr)   <- end(genes_gr) + dn
-    }
-  } else if (!is.null(pad_kb) && pad_kb > 0) {
-    pad <- as.integer(round(pad_kb*1000))
-    start(genes_gr) <- pmax(1L, start(genes_gr) - pad)
-    end(genes_gr)   <- end(genes_gr) + pad
-  }
-  genes_gr
-}
-
-# Add gene symbols from Entrez IDs
-add_symbols <- function(genes_gr) {
-  ids <- as.character(mcols(genes_gr)$gene_id)
-  syms <- AnnotationDbi::mapIds(
-    org.Hs.eg.db, keys = ids, keytype = "ENTREZID", column = "SYMBOL",
-    multiVals = function(x) if (length(x)) x[1] else NA_character_
-  )
-  mcols(genes_gr)$gene_symbol <- unname(syms[ids])
-  genes_gr
-}
-
-# Harmonize seqlevels style (e.g., "chr" vs no "chr")
-match_seqstyle <- function(query, target) {
-  try({
-    style <- seqlevelsStyle(target)[1]
-    seqlevelsStyle(query) <- style
-  }, silent = TRUE)
-  query
-}
-
-overlay_once <- function(regions, genes_pad, out_csv) {
-  regions <- coerce_to_gr(regions)
-  if (length(regions) == 0L) { write.csv(data.frame(), out_csv, row.names = FALSE); return(invisible(0L)) }
-  
-  # Harmonize chromosome naming styles
-  regions <- match_seqstyle(regions, genes_pad)
-  
-  ov <- findOverlaps(regions, genes_pad, ignore.strand = TRUE)
-  if (length(ov) == 0L) { write.csv(data.frame(), out_csv, row.names = FALSE); return(invisible(0L)) }
-  
-  ridx <- queryHits(ov); gidx <- subjectHits(ov)
-  reg_df  <- as.data.frame(regions[ridx])
-  gene_df <- as.data.frame(genes_pad[gidx])
-  
-  keep_reg  <- intersect(c("seqnames","start","end","width","sign",
-                           "deltaEV1_mean","deltaEV1_min","deltaEV1_max",
-                           "deltaEV2_mean","deltaEV2_min","deltaEV2_max","n_bins"),
-                         colnames(reg_df))
-  # TxDb knownGene has 'gene_id' (Entrez); we added 'gene_symbol'
-  keep_gene <- intersect(c("seqnames","start","end","width","gene_id","gene_symbol"),
-                         colnames(gene_df))
-  
-  out <- cbind(
-    setNames(reg_df[keep_reg],   paste0("region_", keep_reg)),
-    setNames(gene_df[keep_gene], paste0("gene_",   keep_gene))
-  )
-  write.csv(out, out_csv, row.names = FALSE)
-  invisible(length(ov))
-}
-
-## ---------------------------
-## Main (TxDb only)
-## ---------------------------
-cat("== Using TxDb.Hsapiens.UCSC.hg19.knownGene (no GTF) ==\n")
+## ===== 1) Build promoter set (hg19) =====
 txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+genetxdb  = genes(TxDb.Hsapiens.UCSC.hg19.knownGene)
+mcols(genetxdb)$gene_id <- names(genetxdb)
+genome(genetxdb) <- "hg19"
 
-genes_gr  <- genes(txdb)        # GRanges with gene_id (Entrez)
-genes_gr  <- add_symbols(genes_gr)
-genes_pad <- pad_genes(genes_gr, pad_kb = pad_kb,
-                       upstream_kb = upstream_kb, downstream_kb = downstream_kb,
-                       strand_aware = strand_aware)
+U <- 2500L; D <- 500L   # promoter window: -2500/+500
+# U <- 0L; D <- 1L   # promoter window: -2500/+500
 
-for (tag in tags) {
-  cat(sprintf("\n== Overlay: %s ==\n", tag))
-  same_path <- file.path(overlay_dir, paste0("genes_", tag, "_same.csv"))
-  diff_path <- file.path(overlay_dir, paste0("genes_", tag, "_diff.csv"))
-  
-  regions_same <- load_regions(input_dir, "same", tag)
-  regions_diff <- load_regions(input_dir, "diff", tag)
-  
-  cat(sprintf("  Regions: SAME=%d, DIFF=%d\n", length(regions_same), length(regions_diff)))
-  n_same <- overlay_once(regions_same, genes_pad, same_path)
-  n_diff <- overlay_once(regions_diff,  genes_pad, diff_path)
-  cat(sprintf("  Overlaps written: SAME=%d -> %s\n", n_same, same_path))
-  cat(sprintf("                     DIFF=%d -> %s\n", n_diff, diff_path))
+prom_gene <- promoters(genetxdb, upstream = U, downstream = D)
+mcols(prom_gene)$gene_id <- mcols(genetxdb)$gene_id
+prom_gene <- trim(prom_gene)
+genome(prom_gene) <- "hg19"
+
+## ===== 2) readers/helpers =====
+
+# find first non-empty (non-whitespace) line
+.first_non_empty <- function(path){
+  lines <- readLines(path, warn = FALSE)
+  nz <- which(nzchar(trimws(lines)))
+  if (!length(nz)) stop("Empty file: ", path)
+  list(lines = lines, first = nz[1])
 }
 
-cat("\n✅ Done. Overlay CSVs are in: ", overlay_dir, "\n")
+# Reader: skips leading blanks, auto-detects delimiter, handles quoted headers
+smart_read_regions <- function(path){
+  info <- .first_non_empty(path)
+  sep <- if (grepl("\t", info$lines[info$first])) "\t" else ","
+  df <- read.table(path,
+                   header = TRUE,
+                   sep = sep,
+                   quote = "\"'",
+                   comment.char = "",
+                   fill = TRUE,
+                   check.names = FALSE,
+                   strip.white = TRUE,
+                   stringsAsFactors = FALSE,
+                   skip = info$first - 1L)
+  # sanitize column names (strip quotes/space/punct; lowercase)
+  norm <- function(x){
+    x <- gsub("^\\s+|\\s+$", "", x)
+    x <- gsub("^\"|\"$", "", x); x <- gsub("^'|'$", "", x); x <- gsub("`", "", x)
+    x <- gsub("[[:space:]]+", "", x)
+    tolower(x)
+  }
+  names(df) <- norm(names(df))
+  df
+}
+
+# Convert to GRanges; attach hg19 lengths, then trim BEFORE validation
+to_regions_gr <- function(csv_path, template_seqinfo){
+  df <- smart_read_regions(csv_path)
+  
+  # accept your names or common aliases
+  pick <- function(cands){
+    ix <- match(cands, names(df))
+    ix <- ix[!is.na(ix)]
+    if (length(ix)) ix[1] else NA_integer_
+  }
+  i_chr   <- pick(c("region_seqnames","chr","chrom","seqnames","chromosome"))
+  i_start <- pick(c("region_start","start","chromstart","start_bp","startpos"))
+  i_end   <- pick(c("region_end","end","chromend","end_bp","endpos"))
+  
+  if (any(is.na(c(i_chr, i_start, i_end)))) {
+    stop("Could not find chr/start/end in: ", csv_path,
+         "\nColumns seen: ", paste(names(df), collapse=", "))
+  }
+  
+  chr <- as.character(df[[i_chr]])
+  st  <- suppressWarnings(as.integer(df[[i_start]]))
+  en  <- suppressWarnings(as.integer(df[[i_end]]))
+  
+  keep <- !is.na(chr) & !is.na(st) & !is.na(en)
+  if (!all(keep)) {
+    warning("Dropping ", sum(!keep), " rows with missing chr/start/end in ", basename(csv_path))
+    chr <- chr[keep]; st <- st[keep]; en <- en[keep]
+  }
+  
+  gr <- GRanges(seqnames = chr, ranges = IRanges(start = st, end = en))
+  genome(gr) <- "hg19"
+  
+  # harmonize styles, restrict to common seqlevels
+  seqlevelsStyle(gr) <- seqlevelsStyle(template_seqinfo)[1]
+  common <- intersect(seqlevels(gr), seqlevels(template_seqinfo))
+  gr <- keepSeqlevels(gr, common, pruning.mode = "coarse")
+  
+  # attach lengths, then TRIM BEFORE validity check to avoid warnings
+  suppressWarnings(seqlengths(gr) <- seqlengths(template_seqinfo)[seqlevels(gr)])
+  gr <- trim(gr)  # clip to chromosome bounds
+  
+  gr
+}
+
+
+# Overlap (bins unstranded) with promoter set; tidy output
+overlap_regions_promoters <- function(regions_gr, promoters_gr){
+  seqlevelsStyle(promoters_gr) <- seqlevelsStyle(regions_gr)[1]
+  common <- intersect(seqlevels(regions_gr), seqlevels(promoters_gr))
+  regions_gr   <- keepSeqlevels(regions_gr,  common, pruning.mode = "coarse")
+  promoters_gr <- keepSeqlevels(promoters_gr, common, pruning.mode = "coarse")
+  
+  hits <- findOverlaps(regions_gr, promoters_gr, ignore.strand = TRUE)
+  # number of region–promoter pairs
+  if (!length(hits)) return(data.frame())
+  
+  ov <- pintersect(regions_gr[queryHits(hits)], promoters_gr[subjectHits(hits)])
+  data.frame(
+    region_chr   = as.character(seqnames(regions_gr))[queryHits(hits)],
+    region_start = start(regions_gr)[queryHits(hits)],
+    region_end   = end(regions_gr)[queryHits(hits)],
+    promoter_chr = as.character(seqnames(promoters_gr))[subjectHits(hits)],
+    promoter_start = start(promoters_gr)[subjectHits(hits)],
+    promoter_end   = end(promoters_gr)[subjectHits(hits)],
+    gene_id     = mcols(promoters_gr)$gene_id[subjectHits(hits)],
+    overlap_bp  = width(ov),
+    frac_region_covered   = width(ov) / width(regions_gr)[queryHits(hits)],
+    frac_promoter_covered = width(ov) / width(promoters_gr)[subjectHits(hits)]
+  )
+}
+
+## ===== 3) Your inputs & run =====
+# change file names
+input_files <- c(
+  "/Users/80030577/Desktop/HiC_analysis/EV_normalization/gene_annotation_ready_to_run_8.11.2025/regions_same_rbl_lcl_vs_nbc_lcl.csv"
+)
+
+for (f in input_files) {
+  message("Processing: ", f)
+  regions_gr <- to_regions_gr(f, template_seqinfo = seqinfo(prom_gene))
+  res <- overlap_regions_promoters(regions_gr, prom_gene)
+  out_file <- sub("\\.csv$", "_overlap_promoters.csv", f, ignore.case = TRUE)
+  write.csv(res, out_file, row.names = FALSE)
+  message("  Saved: ", out_file, " (", nrow(res), " overlaps)")
+}
+
+message("Done! Overlap files written for all inputs.")
