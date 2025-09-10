@@ -1,0 +1,143 @@
+############################################################
+# Human pathway enrichment from promoter-overlap CSV
+# Requires: clusterProfiler, ReactomePA, enrichplot, org.Hs.eg.db
+############################################################
+
+# # One-time install:
+# install.packages("BiocManager")
+# BiocManager::install(c("clusterProfiler","ReactomePA","enrichplot","org.Hs.eg.db"))
+# install.packages("ggplot2")
+
+suppressPackageStartupMessages({
+  library(clusterProfiler)
+  library(ReactomePA)
+  library(enrichplot)
+  library(ggplot2)
+  library(org.Hs.eg.db)
+})
+
+# ---- Input file (your exact path) ----
+infile <- "/Users/80030577/Desktop/HiC_analysis/EV_normalization/gene_annotation_ready_to_run_8.11.2025/overlay_results/promoters_up0_down1_9.2.2025/regions_same_rbl_lcl_vs_nbc_lcl_overlap_promoters.csv"
+stopifnot(file.exists(infile))
+df <- read.csv(infile, header = TRUE, check.names = FALSE)
+stopifnot("gene_id" %in% colnames(df))  # should be Entrez IDs
+
+# Gene list (Entrez)
+genes <- unique(na.omit(as.character(df$gene_id)))
+message("N input genes: ", length(genes))
+
+# ---- Optional: custom universe (background) ----
+# If you want to limit background to genes that *could* be hit, add them here.
+# Common choices:
+#   1) All human Entrez genes in org.Hs.eg.db  (broad)
+#   2) All unique gene_id from your promoter-overlap workflow (narrow)
+#
+# Pick one; default below uses all Entrez in org.Hs.eg.db.
+all_entrez <- keys(org.Hs.eg.db, keytype = "ENTREZID")
+# universe_bg <- unique(all_entrez)           # (1) Broad background
+universe_bg <- unique(df$gene_id)        # (2) Narrow background
+message("Universe size: ", length(universe_bg))
+
+# ---- Enrichment parameters ----
+padj_cut <- 0.05
+q_cut    <- 0.20
+
+# ---- Output directory ----
+base_dir <- dirname(infile)
+out_dir  <- file.path(base_dir, "DAVID_outputs", "enrichment")
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# Helper to write results
+write_enrich <- function(res, name) {
+  if (is.null(res) || nrow(as.data.frame(res)) == 0) return(invisible(NULL))
+  fn <- file.path(out_dir, paste0(name, ".tsv"))
+  write.table(as.data.frame(res), fn, sep = "\t", quote = FALSE, row.names = FALSE)
+  message("Saved: ", fn)
+}
+
+save_dotplot <- function(res, name, top = 20) {
+  if (is.null(res) || nrow(as.data.frame(res)) == 0) return(invisible(NULL))
+  p <- dotplot(res, showCategory = top)
+  fp <- file.path(out_dir, paste0(name, "_dotplot.pdf"))
+  ggsave(fp, plot = p, width = 7, height = 6, units = "in")
+  message("Saved: ", fp)
+}
+
+############################################################
+# 1) GO enrichment (BP/MF/CC) – ENTREZ IDs
+############################################################
+ego_bp <- enrichGO(gene          = genes,
+                   universe      = universe_bg,
+                   OrgDb         = org.Hs.eg.db,
+                   keyType       = "ENTREZID",
+                   ont           = "BP",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff  = padj_cut,
+                   qvalueCutoff  = q_cut,
+                   readable      = TRUE)
+
+ego_mf <- enrichGO(gene = genes, universe = universe_bg,
+                   OrgDb = org.Hs.eg.db, keyType = "ENTREZID",
+                   ont = "MF", pAdjustMethod = "BH",
+                   pvalueCutoff = padj_cut, qvalueCutoff = q_cut,
+                   readable = TRUE)
+
+ego_cc <- enrichGO(gene = genes, universe = universe_bg,
+                   OrgDb = org.Hs.eg.db, keyType = "ENTREZID",
+                   ont = "CC", pAdjustMethod = "BH",
+                   pvalueCutoff = padj_cut, qvalueCutoff = q_cut,
+                   readable = TRUE)
+
+write_enrich(ego_bp, "GO_BP")
+write_enrich(ego_mf, "GO_MF")
+write_enrich(ego_cc, "GO_CC")
+save_dotplot(ego_bp, "GO_BP")
+save_dotplot(ego_mf, "GO_MF")
+save_dotplot(ego_cc, "GO_CC")
+
+############################################################
+# 2) KEGG enrichment – ENTREZ IDs (organism = human)
+############################################################
+# KEGG uses organism code 'hsa'
+ekegg <- enrichKEGG(gene          = genes,
+                    universe      = universe_bg,
+                    organism      = "hsa",
+                    pAdjustMethod = "BH",
+                    pvalueCutoff  = padj_cut,
+                    qvalueCutoff  = q_cut)
+
+# Make gene symbols readable for reporting
+if (!is.null(ekegg) && nrow(as.data.frame(ekegg)) > 0) {
+  ekegg <- setReadable(ekegg, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+}
+write_enrich(ekegg, "KEGG")
+save_dotplot(ekegg, "KEGG")
+
+############################################################
+# 3) Reactome enrichment – ENTREZ IDs
+############################################################
+ereact <- enrichPathway(gene          = genes,
+                        universe      = universe_bg,
+                        organism      = "human",
+                        pvalueCutoff  = padj_cut,
+                        pAdjustMethod = "BH",
+                        qvalueCutoff  = q_cut,
+                        readable      = TRUE)
+
+write_enrich(ereact, "Reactome")
+save_dotplot(ereact, "Reactome")
+
+############################################################
+# Summary to console
+############################################################
+cat("\nEnrichment summary:\n")
+cat("  Input genes (Entrez):", length(genes), "\n")
+cat("  Universe size:        ", length(universe_bg), "\n")
+cat("  Output dir:           ", out_dir, "\n")
+
+summ <- function(x) if (is.null(x)) 0 else nrow(as.data.frame(x))
+cat("  GO_BP terms:          ", summ(ego_bp), "\n")
+cat("  GO_MF terms:          ", summ(ego_mf), "\n")
+cat("  GO_CC terms:          ", summ(ego_cc), "\n")
+cat("  KEGG terms:           ", summ(ekegg), "\n")
+cat("  Reactome terms:       ", summ(ereact), "\n")
